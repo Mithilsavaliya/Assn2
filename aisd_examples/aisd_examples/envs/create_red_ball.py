@@ -1,102 +1,92 @@
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
-
-# ROS 2 & OpenCV
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Image
 from geometry_msgs.msg import Twist
+from sensor_msgs.msg import Image
+from irobot_create_msgs.msg import StopStatus
 from cv_bridge import CvBridge
 import cv2
 
 class RedBall(Node):
     def __init__(self):
         super().__init__('redball_node')
+        self.br = CvBridge()
+        self.latest_x = 320  # Default middle if no ball detected
+        self.create3_is_stopped = True
 
-        self.subscription = self.create_subscription(
+        self.image_sub = self.create_subscription(
             Image,
-            'custom_ns/camera1/image_raw',
+            '/custom_ns/camera1/image_raw',
             self.image_callback,
             10)
-        self.publisher = self.create_publisher(Twist, 'cmd_vel', 10)
 
-        self.br = CvBridge()
-        self.latest_x = 320  # Default center
-        self.image_received = False
+        self.stop_sub = self.create_subscription(
+            StopStatus,
+            '/stop_status',
+            self.stop_callback,
+            10)
+
+        self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
 
     def image_callback(self, msg):
-        try:
-            frame = self.br.imgmsg_to_cv2(msg)
-            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        frame = self.br.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-            lower_red = (110, 100, 100)
-            upper_red = (130, 255, 255)
-            mask = cv2.inRange(hsv, lower_red, upper_red)
+        lower_red = (110, 100, 100)
+        upper_red = (130, 255, 255)
+        mask = cv2.inRange(hsv, lower_red, upper_red)
 
-            blurred = cv2.GaussianBlur(mask, (9, 9), 2)
-            circles = cv2.HoughCircles(blurred, cv2.HOUGH_GRADIENT, 1, 150,
-                                       param1=100, param2=20, minRadius=2, maxRadius=2000)
+        circles = cv2.HoughCircles(mask, cv2.HOUGH_GRADIENT, 1, 150, param1=100, param2=20, minRadius=2, maxRadius=2000)
+        if circles is not None:
+            x = int(circles[0][0][0])
+            self.latest_x = x
+        else:
+            self.latest_x = 320  # Default to center if ball not detected
 
-            if circles is not None:
-                circle = circles[0][0]
-                self.latest_x = int(circle[0])
-            else:
-                self.latest_x = 320  # fallback to center
-            self.image_received = True
-        except Exception as e:
-            self.get_logger().warn(f"Error in image_callback: {e}")
+    def stop_callback(self, msg):
+        self.create3_is_stopped = msg.is_stopped
 
-    def get_redball_x(self):
-        return self.latest_x
+    def step(self, action):
+        twist = Twist()
+        twist.linear.x = 0.0
+        twist.angular.z = (action - 320) / 320 * (np.pi / 2)
+        self.create3_is_stopped = False
+        self.cmd_vel_pub.publish(twist)
 
 class CreateRedBallEnv(gym.Env):
     def __init__(self):
         super().__init__()
-
         rclpy.init()
-        self.redball_node = RedBall()
-
-        self.observation_space = spaces.Discrete(640)  # x-axis position
-        self.action_space = spaces.Discrete(3)  # [0: left, 1: no turn, 2: right]
-
+        self.redball = RedBall()
+        self.observation_space = spaces.Discrete(640)
+        self.action_space = spaces.Discrete(640)
         self.step_count = 0
-        self.max_steps = 100
-
-    def step(self, action):
-        # Publish a Twist command based on action
-        twist = Twist()
-        if action == 0:
-            twist.angular.z = 0.5  # Turn left
-        elif action == 1:
-            twist.angular.z = 0.0  # No turn
-        elif action == 2:
-            twist.angular.z = -0.5  # Turn right
-        self.redball_node.publisher.publish(twist)
-
-        # Spin ROS node once to update image callback
-        rclpy.spin_once(self.redball_node)
-
-        obs = self.redball_node.get_redball_x()
-        reward = 0
-        done = False
-
-        self.step_count += 1
-        if self.step_count >= self.max_steps:
-            done = True
-
-        return obs, reward, done, False, {}
 
     def reset(self, seed=None, options=None):
-        super().reset(seed=seed)
         self.step_count = 0
-        rclpy.spin_once(self.redball_node)
-        obs = self.redball_node.get_redball_x()
-        return obs, {}
+        return self.redball.latest_x, {}
+
+    def step(self, action):
+        self.redball.step(action)
+        rclpy.spin_once(self.redball)
+        while not self.redball.create3_is_stopped:
+            rclpy.spin_once(self.redball)
+        self.step_count += 1
+
+        obs = self.redball.latest_x
+        reward = self.compute_reward(obs)
+        done = self.step_count >= 100
+        return obs, reward, done, False, {}
+
+    def compute_reward(self, x):
+        # reward is max at center, min at edges
+        return -abs(x - 320) / 320
 
     def render(self):
-        return  # No human rendering
+        pass  # no human rendering
 
     def close(self):
-        self.redball_node.destroy_node()
+        self.redball.destroy_node()
         rclpy.shutdown()
